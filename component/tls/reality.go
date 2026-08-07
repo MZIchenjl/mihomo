@@ -31,8 +31,18 @@ const RealityMaxShortIDLen = 8
 type RealityConfig struct {
 	PublicKey *ecdh.PublicKey
 	ShortID   [RealityMaxShortIDLen]byte
+	// ClientVersion is encoded into the first three bytes of the REALITY
+	// session ID. A zero value preserves Mihomo's default 1.8.2 behavior.
+	ClientVersion [3]byte
 
 	SupportX25519MLKEM768 bool
+}
+
+func realityClientVersion(config *RealityConfig) [3]byte {
+	if config.ClientVersion == [3]byte{} {
+		return [3]byte{1, 8, 2}
+	}
+	return config.ClientVersion
 }
 
 func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHelloID, serverName string, realityConfig *RealityConfig) (net.Conn, error) {
@@ -71,9 +81,8 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 		binary.BigEndian.PutUint64(hello.SessionId, uint64(ntp.Now().Unix()))
 
 		copy(hello.SessionId[8:], realityConfig.ShortID[:])
-		hello.SessionId[0] = 1
-		hello.SessionId[1] = 8
-		hello.SessionId[2] = 2
+		clientVersion := realityClientVersion(realityConfig)
+		copy(hello.SessionId[:3], clientVersion[:])
 
 		//log.Debugln("REALITY hello.sessionId[:16]: %v", hello.SessionId[:16])
 
