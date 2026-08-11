@@ -13,8 +13,6 @@ import (
 var magic = [4]byte{'X', '3', '6', '5'}
 
 // BuildFrame builds the connection preamble emitted by efanapp's x365 core.
-// IPv4 addresses occupy the first four bytes of the 16-byte IP field and the
-// remaining bytes are zero, rather than using an IPv4-mapped IPv6 address.
 func BuildFrame(id [16]byte, network string, port uint16, address string) ([]byte, error) {
 	if port == 0 {
 		return nil, errors.New("x365: target port must be non-zero")
@@ -35,14 +33,12 @@ func BuildFrame(id [16]byte, network string, port uint16, address string) ([]byt
 	binary.BigEndian.PutUint16(frame[22:24], port)
 
 	if ip := net.ParseIP(address); ip != nil {
-		frame[24] = 3
-		payload := make([]byte, net.IPv6len)
 		if v4 := ip.To4(); v4 != nil {
-			copy(payload, v4)
-		} else {
-			copy(payload, ip.To16())
+			frame[24] = 1
+			return append(frame, v4...), nil
 		}
-		return append(frame, payload...), nil
+		frame[24] = 3
+		return append(frame, ip.To16()...), nil
 	}
 
 	if len(address) > 255 {

@@ -90,7 +90,9 @@ func (c *Client) DialContext(ctx context.Context, network, address string, port 
 	}
 
 	requestReader, requestWriter := io.Pipe()
-	streamCtx, cancel := context.WithCancel(ctx)
+	// Like net.Dialer, the returned connection must outlive the context used to
+	// establish it. Mihomo cancels the UDP setup context after PacketConn creation.
+	streamCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	request, err := http.NewRequestWithContext(streamCtx, http.MethodPost, c.endpointURL(), requestReader)
 	if err != nil {
 		cancel()
@@ -126,22 +128,25 @@ func (c *Client) DialContext(ctx context.Context, network, address string, port 
 		writeResult <- writeErr
 	}()
 
-	waitResponse := func() (net.Conn, error) {
-		outcome := <-result
-		if outcome.err != nil {
-			cancel()
-			_ = requestWriter.CloseWithError(outcome.err)
-			return nil, outcome.err
-		}
-		return &streamConn{reader: outcome.reader, writer: requestWriter, cancel: cancel, datagram: strings.EqualFold(network, "udp")}, nil
-	}
-
 	select {
 	case outcome := <-result:
 		if outcome.err != nil {
 			cancel()
 			_ = requestWriter.CloseWithError(outcome.err)
 			return nil, outcome.err
+		}
+		select {
+		case writeErr := <-writeResult:
+			if writeErr != nil {
+				cancel()
+				_ = outcome.reader.Close()
+				return nil, fmt.Errorf("x365: write request preamble: %w", writeErr)
+			}
+		case <-ctx.Done():
+			cancel()
+			_ = outcome.reader.Close()
+			_ = requestWriter.CloseWithError(ctx.Err())
+			return nil, ctx.Err()
 		}
 		return &streamConn{reader: outcome.reader, writer: requestWriter, cancel: cancel, datagram: strings.EqualFold(network, "udp")}, nil
 	case writeErr := <-writeResult:
@@ -150,7 +155,10 @@ func (c *Client) DialContext(ctx context.Context, network, address string, port 
 			_ = requestWriter.CloseWithError(writeErr)
 			return nil, fmt.Errorf("x365: write request preamble: %w", writeErr)
 		}
-		return waitResponse()
+		// Some x365 servers wait for the first UDP datagram before returning the
+		// HTTP response. Defer response validation to the first Read to avoid a
+		// UDP-association deadlock.
+		return &streamConn{response: result, writer: requestWriter, cancel: cancel, datagram: strings.EqualFold(network, "udp")}, nil
 	case <-ctx.Done():
 		cancel()
 		_ = requestWriter.CloseWithError(ctx.Err())
@@ -159,7 +167,7 @@ func (c *Client) DialContext(ctx context.Context, network, address string, port 
 }
 
 func (c *Client) endpointURL() string {
-	return (&url.URL{Scheme: "https", Host: c.node.ServerAddr(), Path: c.node.Path}).String()
+	return (&url.URL{Scheme: "https", Host: c.node.Host, Path: c.node.Path}).String()
 }
 
 func (c *Client) referer() string {
@@ -167,9 +175,9 @@ func (c *Client) referer() string {
 	if err != nil {
 		padding = big.NewInt(0)
 	}
-	u := &url.URL{Scheme: "https", Host: c.node.ServerAddr(), Path: c.node.Path}
+	u := &url.URL{Scheme: "https", Host: c.node.Host, Path: c.node.Path}
 	query := u.Query()
-	query.Set("padding", strings.Repeat("0", 100+int(padding.Int64())))
+	query.Set("x_padding", strings.Repeat("X", 100+int(padding.Int64())))
 	u.RawQuery = query.Encode()
 	return u.String()
 }
@@ -193,6 +201,7 @@ func (r *responseReader) Close() error { return r.close() }
 
 type streamConn struct {
 	reader       *responseReader
+	response     <-chan streamResult
 	writer       *io.PipeWriter
 	cancel       context.CancelFunc
 	once         sync.Once
@@ -204,9 +213,7 @@ type streamConn struct {
 }
 
 func (c *streamConn) Read(p []byte) (int, error) {
-	c.responseOnce.Do(func() {
-		c.responseErr = ReadResponseHeader(c.reader)
-	})
+	c.ensureResponse()
 	if c.responseErr != nil {
 		return 0, c.responseErr
 	}
@@ -216,6 +223,20 @@ func (c *streamConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 	return readDatagram(c.reader, p)
+}
+
+func (c *streamConn) ensureResponse() {
+	c.responseOnce.Do(func() {
+		if c.reader == nil {
+			outcome := <-c.response
+			if outcome.err != nil {
+				c.responseErr = outcome.err
+				return
+			}
+			c.reader = outcome.reader
+		}
+		c.responseErr = ReadResponseHeader(c.reader)
+	})
 }
 
 func (c *streamConn) Write(p []byte) (int, error) {
@@ -231,7 +252,10 @@ func (c *streamConn) Close() error {
 	c.once.Do(func() {
 		c.cancel()
 		_ = c.writer.Close()
-		closeErr = c.reader.Close()
+		c.ensureResponse()
+		if c.reader != nil {
+			closeErr = c.reader.Close()
+		}
 	})
 	return closeErr
 }

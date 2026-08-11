@@ -73,8 +73,16 @@ func verifyRequest(t *testing.T, request *http.Request, expectedPreamble []byte)
 		t.Errorf("invalid referer: %v", err)
 		return false
 	}
-	padding := referer.Query().Get("padding")
-	if len(padding) < 100 || len(padding) > 999 || strings.Trim(padding, "0") != "" {
+	if referer.Scheme != "https" || referer.Host != "authority.example" || referer.Path != request.URL.Path {
+		t.Errorf("unexpected referer target %q", referer.String())
+		return false
+	}
+	if len(referer.Query()) != 1 {
+		t.Errorf("unexpected referer query keys")
+		return false
+	}
+	padding := referer.Query().Get("x_padding")
+	if len(padding) < 100 || len(padding) > 999 || strings.Trim(padding, "X") != "" {
 		t.Errorf("unexpected referer padding length %d", len(padding))
 		return false
 	}
@@ -177,5 +185,124 @@ func TestH2UDPDatagramStream(t *testing.T) {
 	}
 	if !bytes.Equal(response[:n], payload) {
 		t.Fatalf("unexpected UDP response %x", response[:n])
+	}
+}
+
+func TestH2UDPServerWaitsForFirstDatagram(t *testing.T) {
+	expected, err := BuildFrame(testUUID(t), "udp", 53, "dns.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, closeClient := newH2TestClient(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !verifyRequest(t, request, expected) {
+			return
+		}
+		var header [2]byte
+		if _, readErr := io.ReadFull(request.Body, header[:]); readErr != nil {
+			t.Errorf("read UDP header before response: %v", readErr)
+			return
+		}
+		payload := make([]byte, binary.BigEndian.Uint16(header[:]))
+		if _, readErr := io.ReadFull(request.Body, payload); readErr != nil {
+			t.Errorf("read UDP payload before response: %v", readErr)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte("X365\x00"))
+		_, _ = writer.Write(header[:])
+		_, _ = writer.Write(payload)
+		writer.(http.Flusher).Flush()
+	}))
+	defer closeClient()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "udp", "dns.example", 53)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	payload := []byte{1, 2, 3, 4}
+	if _, err = conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, 16)
+	n, err := conn.Read(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(response[:n], payload) {
+		t.Fatalf("unexpected UDP response %x", response[:n])
+	}
+}
+
+func TestH2UDPStreamOutlivesDialContext(t *testing.T) {
+	expected, err := BuildFrame(testUUID(t), "udp", 53, "dns.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, closeClient := newH2TestClient(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !verifyRequest(t, request, expected) {
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		var header [2]byte
+		if _, readErr := io.ReadFull(request.Body, header[:]); readErr != nil {
+			t.Errorf("read UDP header: %v", readErr)
+			return
+		}
+		payload := make([]byte, binary.BigEndian.Uint16(header[:]))
+		if _, readErr := io.ReadFull(request.Body, payload); readErr != nil {
+			t.Errorf("read UDP payload: %v", readErr)
+			return
+		}
+		_, _ = writer.Write([]byte("X365\x00"))
+		_, _ = writer.Write(header[:])
+		_, _ = writer.Write(payload)
+		writer.(http.Flusher).Flush()
+	}))
+	defer closeClient()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	conn, err := client.DialContext(ctx, "udp", "dns.example", 53)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	defer conn.Close()
+	payload := []byte{5, 6, 7, 8}
+	if _, err = conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, 16)
+	n, err := conn.Read(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(response[:n], payload) {
+		t.Fatalf("unexpected UDP response %x", response[:n])
+	}
+}
+
+func TestCloseBeforeHTTPResponse(t *testing.T) {
+	client, closeClient := newH2TestClient(t, http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	defer closeClient()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "udp", "dns.example", 53)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- conn.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close blocked waiting for the HTTP response")
 	}
 }

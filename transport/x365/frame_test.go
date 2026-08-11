@@ -30,16 +30,16 @@ func TestBuildDomainTCPFrame(t *testing.T) {
 	}
 }
 
-func TestBuildIPv4FrameUsesZeroPadding(t *testing.T) {
+func TestBuildIPv4Frame(t *testing.T) {
 	frame, err := BuildFrame(testUUID(t), "tcp", 80, "192.0.2.1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(frame) != 41 || frame[24] != 3 {
+	if len(frame) != 29 || frame[24] != 1 {
 		t.Fatalf("unexpected IP frame: %x", frame)
 	}
-	if !bytes.Equal(frame[25:29], []byte{192, 0, 2, 1}) || !bytes.Equal(frame[29:], make([]byte, 12)) {
-		t.Fatalf("IPv4 was not zero-padded: %x", frame[25:])
+	if !bytes.Equal(frame[25:], []byte{192, 0, 2, 1}) {
+		t.Fatalf("unexpected IPv4 payload: %x", frame[25:])
 	}
 }
 
