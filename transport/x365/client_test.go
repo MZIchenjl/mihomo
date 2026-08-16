@@ -139,6 +139,56 @@ func TestH2TCPBidirectionalStream(t *testing.T) {
 	}
 }
 
+func TestH2TCPCloseWriteHalfClosePreservesRead(t *testing.T) {
+	expected, err := BuildFrame(testUUID(t), "tcp", 22, "ssh.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, closeClient := newH2TestClient(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !verifyRequest(t, request, expected) {
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte("X365\x00"))
+		writer.(http.Flusher).Flush()
+		// Draining until EOF proves the client's END_STREAM arrived; the
+		// response must still be writable afterwards.
+		if _, readErr := io.Copy(io.Discard, request.Body); readErr != nil {
+			t.Errorf("drain request body: %v", readErr)
+			return
+		}
+		_, _ = writer.Write([]byte("after-eof"))
+		writer.(http.Flusher).Flush()
+	}))
+	defer closeClient()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "tcp", "ssh.example", 22)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	halfCloser, ok := conn.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("x365 stream conn does not implement CloseWrite")
+	}
+	if err = halfCloser.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Write([]byte("late")); err == nil {
+		t.Error("write after CloseWrite unexpectedly succeeded")
+	}
+	response := make([]byte, len("after-eof"))
+	if _, err = io.ReadFull(conn, response); err != nil {
+		t.Fatalf("read after CloseWrite: %v", err)
+	}
+	if string(response) != "after-eof" {
+		t.Fatalf("unexpected response after half-close %q", response)
+	}
+}
+
 func TestH2UDPDatagramStream(t *testing.T) {
 	expected, err := BuildFrame(testUUID(t), "udp", 53, "dns.example")
 	if err != nil {
