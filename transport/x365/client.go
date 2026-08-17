@@ -247,6 +247,13 @@ func (c *streamConn) Write(p []byte) (int, error) {
 	defer c.writeMu.Unlock()
 	return writeDatagram(c.writer, p)
 }
+// CloseWrite ends only the client→server direction: closing the request pipe
+// makes the HTTP/2 transport see the body EOF and send END_STREAM while the
+// response body stays readable. N.Relay reaches this through common.Cast
+// (Upstream chain); without it the relay falls back to closing the whole
+// stream, killing the read direction on a local half-close.
+func (c *streamConn) CloseWrite() error { return c.writer.Close() }
+
 func (c *streamConn) Close() error {
 	var closeErr error
 	c.once.Do(func() {
